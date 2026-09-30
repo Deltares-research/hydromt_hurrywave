@@ -189,7 +189,9 @@ class HurrywaveQuadtreeMask(ModelComponent):
             if "z" not in self.data:
                 raise ValueError("z required in combination with zmin / zmax")
             uda_dep = self.data["z"]
-            _msk = uda_dep != np.nan
+            # cells without a valid elevation are never active
+            # (note: ``!= np.nan`` is always True, hence isnan)
+            _msk = ~np.isnan(uda_dep)
             if zmin is not None:
                 _msk = np.logical_and(_msk, uda_dep >= zmin)
             if zmax is not None:
