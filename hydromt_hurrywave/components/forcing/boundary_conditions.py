@@ -496,16 +496,14 @@ class HurrywaveBoundaryConditions(ModelComponent):
             raise ValueError("Mask must be loaded before generating boundary points.")
 
         grid = self.model.quadtree_grid.data
-        if min_dist is None:
-            # Use a rough estimate: root of face area
-            coords = grid.grid.face_coordinates
-            areas = grid.grid.face_areas if hasattr(grid.grid, "face_areas") else None
-            if areas is not None:
-                min_dist = 2.0 * float(np.sqrt(np.median(areas)))
-            else:
-                min_dist = 1e4  # fallback 10 km
-
         ibnd = np.where(mask.values == 2)[0]
+        if min_dist is None and len(ibnd) > 0:
+            # Two cell sizes of the boundary cells, in model CRS units.
+            # xugrid exposes cell areas as Ugrid2d.area (not face_areas).
+            areas = np.asarray(grid.grid.area)
+            cell_size = float(np.sqrt(np.median(areas[ibnd])))
+            min_dist = 2.0 * cell_size
+
         xy = grid.grid.face_coordinates
         xp, yp = xy[ibnd, 0], xy[ibnd, 1]
 
