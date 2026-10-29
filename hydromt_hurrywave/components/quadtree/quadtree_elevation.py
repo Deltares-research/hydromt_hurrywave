@@ -60,6 +60,7 @@ class HurrywaveQuadtreeElevation(MeshComponent):
         mean_wet: bool = False,
         nr_subgrid_pixels: int = 20,
         threshold_level: float = 0.0,
+        interpolate_na: bool = False,
     ):
         """Interpolate topobathy (z) data to the quadtree grid.
 
@@ -109,6 +110,12 @@ class HurrywaveQuadtreeElevation(MeshComponent):
             Elevation threshold [m] separating wet from dry sub-grid pixels
             in the mean-wet pass, by default 0.0.  Ignored when
             ``mean_wet=False``.
+        interpolate_na : bool, optional
+            Whether to interpolate (and extrapolate) missing values (NaNs) in
+            the elevation, by default False: cells without elevation data stay
+            NaN, so the mask step keeps them inactive. When True, each missing
+            cell gets the inverse-distance weighted elevation of the nearest
+            cells that have data.
         """
         # ----------------------------------------------------------
         # Standard cell-centre interpolation
@@ -233,6 +240,17 @@ class HurrywaveQuadtreeElevation(MeshComponent):
                 zmin=zmin,
                 zmax=zmax,
             )
+
+        # ----------------------------------------------------------
+        # Optional filling of cells without elevation data
+        # ----------------------------------------------------------
+        z = self.data["z"].values
+        nmissing = int(np.sum(np.isnan(z)))
+        if nmissing > 0 and interpolate_na:
+            logger.warning(f"Interpolate elevation at {nmissing} cells")
+            self.data["z"][:] = fill_nan_idw(xy[:, 0], xy[:, 1], z)
+        elif nmissing > 0:
+            logger.info(f"Elevation has {nmissing} missing cells; leaving them as NaN")
 
     @hydromt_step
     def create_uniform(self, zb: float):
@@ -519,3 +537,43 @@ def _interp2(x0, y0, z0, x1, y1, method="linear"):
         y1 = y1.reshape(sz[0] * sz[1])
         return f((y1, x1)).reshape(sz)
     return f((y1, x1))
+
+
+def fill_nan_idw(x, y, z, k: int = 8, power: float = 2.0):
+    """Fill NaN values by inverse-distance weighting of the nearest valid points.
+
+    Every point with a NaN value gets the inverse-distance weighted mean of the
+    *k* nearest points that have a value, also far away from the data
+    (extrapolation).
+
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Point coordinates (e.g. quadtree cell centres).
+    z : np.ndarray
+        Values at the points, with NaN where missing.
+    k : int, optional
+        Number of nearest valid points to use, by default 8.
+    power : float, optional
+        Power of the inverse-distance weights, by default 2.
+
+    Returns
+    -------
+    np.ndarray
+        Copy of *z* without NaN values (unchanged if there are no valid points).
+    """
+    from scipy.spatial import cKDTree
+
+    z = np.array(z, dtype=float)
+    missing = np.isnan(z)
+    valid = ~missing
+    if not missing.any() or not valid.any():
+        return z
+    k = min(k, int(valid.sum()))
+    tree = cKDTree(np.column_stack((x[valid], y[valid])))
+    dist, inear = tree.query(np.column_stack((x[missing], y[missing])), k=k)
+    if k == 1:
+        dist, inear = dist[:, None], inear[:, None]
+    weights = 1.0 / np.maximum(dist, 1e-12) ** power
+    z[missing] = np.sum(weights * z[valid][inear], axis=1) / np.sum(weights, axis=1)
+    return z

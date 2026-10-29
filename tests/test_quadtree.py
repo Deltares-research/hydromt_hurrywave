@@ -2,7 +2,13 @@
 
 import numpy as np
 import pytest
+import shapely
+import shapely.ops
+import xarray as xr
+import xugrid as xu
 from pyproj import CRS
+
+from hydromt_hurrywave.components.quadtree.quadtree import HurrywaveQuadtreeGrid
 
 from constants import DX, DY, EPSG, MMAX, NMAX, X0, Y0
 
@@ -121,3 +127,92 @@ class TestQuadtreeMask:
     def test_to_gdf(self, model_with_mask):
         gdf = model_with_mask.quadtree_mask.to_gdf(option="active")
         assert len(gdf) > 0
+
+
+def test_quadtree_exterior_matches_edge_polygonization():
+    mesh = xu.Ugrid2d(
+        node_x=np.array([0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0]),
+        node_y=np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0]),
+        fill_value=-1,
+        face_node_connectivity=np.array(
+            [[0, 1, 4, 3], [1, 2, 5, 4], [3, 4, 7, 6], [4, 5, 8, 7]]
+        ),
+        crs="EPSG:32631",
+    )
+    grid_component = object.__new__(HurrywaveQuadtreeGrid)
+    grid_component._data = xu.UgridDataset(xr.Dataset(), mesh)
+
+    # Reference: the original (slow) per-edge implementation
+    edge_nodes = mesh.edge_node_connectivity[mesh.exterior_edges, :]
+    x = mesh.node_x[edge_nodes]
+    y = mesh.node_y[edge_nodes]
+    expected_lines = [
+        shapely.LineString(np.column_stack((x[i], y[i]))) for i in range(len(x))
+    ]
+    expected_merged = shapely.ops.linemerge(expected_lines)
+    expected_polygons = list(shapely.ops.polygonize(expected_merged))
+
+    exterior = grid_component.exterior
+
+    assert exterior.crs == grid_component.crs
+    assert len(exterior) == len(expected_polygons)
+    assert shapely.union_all(exterior.geometry.array).equals(
+        shapely.union_all(expected_polygons)
+    )
+    # Cached: the same object is returned on the next call
+    assert grid_component.exterior is exterior
+
+
+def test_quadtree_exterior_cache_refreshes_for_new_grid(model_with_grid):
+    grid = model_with_grid.quadtree_grid
+    first = grid.exterior
+    assert grid.exterior is first
+    # Building a new (larger) grid must not return the cached exterior
+    grid.create(
+        x0=X0, y0=Y0, nmax=2 * NMAX, mmax=2 * MMAX,
+        dx=DX, dy=DY, rotation=0.0, epsg=EPSG,
+    )
+    second = grid.exterior
+    assert second is not first
+    assert second.geometry.area.sum() == pytest.approx(
+        4.0 * first.geometry.area.sum()
+    )
+
+
+@pytest.fixture
+def half_covered_elevation():
+    """DEM covering only the western half of a 10 x 10 km grid (x < 5000 m)."""
+    import hydromt  # noqa: F401 (registers the raster accessor)
+
+    x = np.arange(-500.0, 5000.0, 50.0) + 25.0
+    y = np.arange(-500.0, 10500.0, 50.0) + 25.0
+    da = xr.DataArray(
+        np.tile(-10.0 + x / 1000.0, (len(y), 1)),
+        coords={"y": y, "x": x},
+        dims=("y", "x"),
+    )
+    da.raster.set_crs(32631)
+    da.raster.set_nodata(-9999.0)
+    return da
+
+
+@pytest.mark.parametrize("interpolate_na", [None, False, True])
+def test_elevation_interpolate_na(tmp_path, half_covered_elevation, interpolate_na):
+    from hydromt_hurrywave import HurrywaveModel
+
+    model = HurrywaveModel(root=str(tmp_path), mode="w")
+    model.quadtree_grid.create(0.0, 0.0, 10, 10, 1000.0, 1000.0, 0.0, epsg=32631)
+    kwargs = {} if interpolate_na is None else {"interpolate_na": interpolate_na}
+    model.quadtree_elevation.create([{"elevation": half_covered_elevation}], **kwargs)
+    z = model.quadtree_grid.data["z"].values
+    model.quadtree_mask.create(zmin=-20.0, zmax=10.0)
+    active = model.quadtree_grid.data["mask"].values > 0
+    if interpolate_na:
+        # missing cells are filled with values close to the nearest data
+        assert not np.any(np.isnan(z))
+        assert active.all()
+        assert np.nanmin(z) >= -10.0 and np.nanmax(z) <= -5.0
+    else:
+        # default: cells without data stay NaN and inactive
+        assert int(np.isnan(z).sum()) == 50
+        assert int(active.sum()) == 50
